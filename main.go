@@ -1,16 +1,19 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
-	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type URL struct {
-  LongURL string `json:"url"`
+  ShortURL  string `json:"short_url"`
+  LongURL   string `json:"long_url"`
 }
 
 type SuccessRes struct {
@@ -18,29 +21,55 @@ type SuccessRes struct {
   ShortURL  string  `json:"shorturl"`
 }
 
-var urlStore = make(map[string]string)
+const (
+  alphabet  = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  base      = float64(len(alphabet))
+)
 
-func generateShortURL() string {
-  r := rand.New(rand.NewSource(time.Now().UnixNano()))
-  res := ""
-  alpha := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU"
-  for {
-    if len(res) == 5 && urlStore[res] == "" {
-      return res 
-    } else if len(res) == 5 && urlStore[res] != "" {
-      res = ""
-    }
-    random := r.Intn(len(alpha) - 1)
-    res += string(alpha[random])
+var urlStore = make(map[string]string)
+var db *sql.DB
+
+func InitDB() {
+  var err error
+  db, err = sql.Open("sqlite3", "./urls.db")
+  if err != nil {
+    log.Fatal(err)
+  }
+
+  createTableQuery := 
+  `CREATE TABLE IF NOT EXISTS tb_urls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    short_url TEXT NOT NULL UNIQUE, 
+    long_url TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );`
+  
+  _, err = db.Exec(createTableQuery)
+  if err != nil {
+    log.Fatal(err)
   }
 }
 
-func shortenHandler(w http.ResponseWriter, r *http.Request) {
-  if r.Method != "POST"{
-    http.Error(w, "", http.StatusBadRequest) 
-    return
-  }
+func loadData() error {
+  clear(urlStore)
 
+  rows, err := db.Query(`SELECT short_url, long_url FROM tb_urls;`) 
+  if err != nil {
+    return errors.New("Fail to fetch recent data")
+  }
+  defer rows.Close()
+
+  for rows.Next() { 
+    var url URL
+    if err := rows.Scan(&url.ShortURL, &url.LongURL); err != nil {
+      return errors.New("fail to load recent data")
+    }
+    urlStore[url.ShortURL] = url.LongURL
+  }
+  return nil
+}
+
+func shortenHandler(w http.ResponseWriter, r *http.Request) {
   var body URL
   
   if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -48,10 +77,22 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
     return
   }
 
-  shortUrl := generateShortURL()
-  urlStore[shortUrl] = body.LongURL
+  stmt, err := db.Prepare("INSERT INTO tb_urls (short_url, long_url) VALUES(?, ?);")
+  if err != nil {
+    http.Error(w, "Failed to Prepare statment", http.StatusInternalServerError)
+    return
+  }
+  defer stmt.Close()
 
-  response := &SuccessRes{ Status: "success", ShortURL: shortUrl}
+  _ , err = stmt.Exec(body.ShortURL, body.LongURL)
+  if err != nil {
+    http.Error(w, fmt.Sprintf("[ERROR] %s", err.Error()), http.StatusBadRequest)
+    return
+  }
+
+  urlStore[body.ShortURL] = body.LongURL
+
+  response := &SuccessRes{ Status: "success", ShortURL: body.ShortURL}
   jsonByte, err := json.Marshal(response)
   if err != nil {
     http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -63,25 +104,28 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func redirectHandler(w http.ResponseWriter, r *http.Request) {
-  if r.Method != "GET" {
-    http.Error(w, "", http.StatusBadRequest)
-    return
-  }
-
   p := r.PathValue("code")
-  longURL, found := urlStore[p]
+  url, found := urlStore[p] 
   if !found {
     http.NotFound(w, r)
     return
   }
 
-  http.Redirect(w, r, longURL, http.StatusFound)
+  http.Redirect(w, r, url, http.StatusFound)
 }
 
-func main() {
-  http.HandleFunc("/shorten", shortenHandler)
-  http.HandleFunc("/{code}", redirectHandler)
+func main() { 
+  InitDB()
+  err := loadData()
+  if err != nil {
+    fmt.Println(err.Error())
+  }
+
+  mux := http.NewServeMux()
+
+  mux.HandleFunc("POST /shorten", shortenHandler)
+  mux.HandleFunc("GET /{code}", redirectHandler)
 
   fmt.Println("[INFO] Server is running on port 6969")
-  log.Fatal(http.ListenAndServe(":6969", nil))
+  log.Fatal(http.ListenAndServe(":6969", mux))
 }
